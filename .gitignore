@@ -1,0 +1,27 @@
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Windows image file caches
+Thumbs.db
+ehthumbs.db
+
+# Folder config file
+Desktop.ini
+
+# Recycle Bin used on file shares
+$RECYCLE.BIN/
+
+# Windows Installer files
+*.exe
+*.msi
+*.7z
+
+# VS Code
+.vscode/
+
+# User-specific files
+last_version.txt
