@@ -2,7 +2,7 @@
 
 <center>
 
-**Portable RemNote installation and automatic update system for Windows - No admin rights required!**
+**Portable RemNote installation and automatic updates for Windows - No admin rights required!**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
@@ -18,74 +18,35 @@ Automatically monitors the RemNote RSS feed for new stable releases and updates 
 - ✅ **Smart Version Detection** - Ignores beta versions, only stable releases
 - ✅ **Portable Installation** - Fully self-contained in user directory
 - ✅ **Safe Updates** - Creates backup before updating with automatic rollback on failure
-- ✅ **Duplicate Prevention** - SHA256 hash comparison to avoid redundant downloads
-- ✅ **User-Friendly** - Clean popup dialogs for update confirmation
-- ✅ **Graceful Process Handling** - Safely closes RemNote before updating
 - ✅ **Comprehensive Logging** - Detailed logs for troubleshooting
 - ✅ **Lightweight** - Minimal resource usage, efficient scheduling
 
 ## 📋 Prerequisites
 
-- **Windows 10/11** (PowerShell 5.1 or higher - included by default)
-- **7-Zip** must be installed ([Download here](https://www.7-zip.org/))
-- **Internet connection** for downloading updates
+| Requirement | Notes |
+|---|---|
+| Windows 10 / 11 | PowerShell 5.1 is built in — no extra install |
+| Internet connection | For downloading RemNote and (one-time) SharpCompress |
 
-## 🚀 Quick Start
+## Usage/Installation
 
-### 1. Download & Setup
+1. [Download this repository as a ZIP](https://github.com/sukarth/remnote-updater/archive/refs/heads/main.zip) and extract it anywhere (e.g. your Desktop).
+2. Double-click **`Install.bat`**.
+3. That's it. ✅
 
+On first run the script will:
+- Download RemNote (if not already installed)
+- Register a **Windows Task Scheduler** entry so updates are checked automatically every hour — even after reboots
+- All files are stored in `%LOCALAPPDATA%\RemNote` and `%LOCALAPPDATA%\RemNoteTemp` — no admin rights ever needed
+
+## Uninstallation
+
+Run the below command in powershell (terminal):
 ```powershell
-# Clone or download this repository
-git clone https://github.com/sukarth/remnote-updater.git
-cd remnote-updater
-
-# Or download and extract the ZIP file from GitHub
+.\RemNoteUpdater.ps1 -Uninstall
 ```
 
-### 2. First-Time Installation
-
-```powershell
-# Run once to download and install RemNote
-.\RemNoteUpdater.ps1 -RunOnce
-```
-
-This will:
-- Download the latest stable RemNote version
-- Extract it to `%LOCALAPPDATA%\RemNote`
-- Launch RemNote automatically
-
-### 3. Set Up Auto-Updates (Optional)
-
-See [Auto-Start Setup](#auto-start-setup) below to run the updater automatically on Windows startup.
-
-## 📖 Usage
-
-### Check for Updates Now (Run Once)
-```powershell
-.\RemNoteUpdater.ps1 -RunOnce
-```
-
-### Monitor Continuously (Default: Check Every Hour)
-```powershell
-.\RemNoteUpdater.ps1
-```
-
-### Custom Check Interval (e.g., Every 30 Minutes)
-```powershell
-.\RemNoteUpdater.ps1 -CheckIntervalMinutes 30
-```
-
-### Custom Installation Path
-```powershell
-.\RemNoteUpdater.ps1 -InstallPath "D:\MyApps\RemNote" -TempPath "D:\MyApps\RemNoteTemp"
-```
-
-### Run Silently in Background
-```powershell
-Start-Process powershell -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PWD\RemNoteUpdater.ps1`"" -WindowStyle Hidden
-```
-
-Or simply double-click **`RunUpdater.bat`** for easy launching.
+This removes the scheduled task. To fully clean up, delete the `%LOCALAPPDATA%\RemNote` and `%LOCALAPPDATA%\RemNoteTemp` folders.
 
 ## 🔧 Configuration
 
@@ -93,7 +54,7 @@ Or simply double-click **`RunUpdater.bat`** for easy launching.
 
 | Path | Default Location | Description |
 |------|------------------|-------------|
-| Installation | `%LOCALAPPDATA%\RemNote` | Where RemNote is installed |
+| Installation | `%LOCALAPPDATA%\RemNote` | Where RemNote.exe is installed |
 | Temp/Cache | `%LOCALAPPDATA%\RemNoteTemp` | Downloads and logs |
 | Backup | `%LOCALAPPDATA%\RemNote_Backup` | Backup during updates |
 
@@ -107,6 +68,8 @@ Or simply double-click **`RunUpdater.bat`** for easy launching.
 | `-CheckIntervalMinutes` | Integer | 60 | Minutes between checks |
 | `-InstallPath` | String | `%LOCALAPPDATA%\RemNote` | Custom install location |
 | `-TempPath` | String | `%LOCALAPPDATA%\RemNoteTemp` | Custom temp location |
+| `-Uninstall` | - | - | Remove the scheduled task |
+| `-Setup` | - | - | Run setup that registers the scheduled task |
 
 ### Customizing RSS Feed or Download URL
 
@@ -119,51 +82,30 @@ $INSTALLER_DOWNLOAD_URL = "https://backend.remnote.com/desktop/windows"
 
 ## 🔄 How It Works
 
-1. **RSS Monitoring**: Checks RemNote's changelog RSS feed for the latest stable release
-2. **Version Comparison**: Compares with previously installed version
-3. **Download**: Downloads NSIS installer to temp directory if new version available
-4. **Hash Verification**: SHA256 comparison prevents re-downloading identical files
-5. **User Prompt**: Shows dialog if RemNote is running, requesting to close it
-6. **NSIS Extraction**: Extracts NSIS installer wrapper to temp directory
-7. **App Extraction**: Extracts `app-64.7z` (or `app-32.7z`) containing RemNote
-8. **Backup**: Renames current installation to backup before updating
-9. **Install**: Extracts RemNote application to installation directory
-10. **Verify**: Confirms `RemNote.exe` exists in installation
-11. **Launch**: Automatically starts RemNote
-12. **Cleanup**: Removes backup and temporary files after successful update
+1. Reads the [RemNote changelog RSS feed](https://feedback.remnote.com/rss/changelog.xml) — skips beta versions
+2. If a new stable version is found, downloads the installer from official RemNote servers
+3. Extracts the app silently using **SharpCompress** (a ~500 KB .NET library, downloaded automatically on first run — no user action needed)
+4. Backs up your current install, deploys the new version, then launches RemNote
+5. If RemNote is open when an update is found, a prompt asks whether to update now or later
+6. Confirms `RemNote.exe` exists in installation and auto starts it
+7. Removes temporary files after successful update
 
-## Auto-Start Setup
 
-### Option 1: Task Scheduler (Recommended)
+## Manual / advanced usage
 
-1. Open **Task Scheduler** (`taskschd.msc`)
-2. Click **Create Task** (not Basic Task)
-3. **General** tab:
-   - Name: `RemNote Auto Updater`
-   - Description: `Monitors for RemNote updates`
-   - Select: "Run whether user is logged on or not"
-   - **DO NOT** check "Run with highest privileges" (not needed!)
-4. **Triggers** tab:
-   - New → At startup (or At log on)
-   - Delay: 1 minute (optional)
-5. **Actions** tab:
-   - New → Start a program
-   - Program: `powershell.exe`
-   - Arguments: `-WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Path\To\RemNoteUpdater.ps1"`
-   - **Replace** `C:\Path\To\` with your actual path
-6. **Conditions** tab:
-   - Check "Start only if the following network connection is available"
-7. Click **OK**
+```powershell
+# Check for updates right now (one-shot, no scheduling)
+.\RemNoteUpdater.ps1 -RunOnce
 
-### Option 2: Startup Folder
+# Run the setup again (re-registers the scheduled task)
+.\RemNoteUpdater.ps1 -Setup
 
-1. Press `Win + R`, type `shell:startup`, press Enter
-2. Create a shortcut to `RunUpdater.bat`
-3. Or create a shortcut with target:
-   ```
-   powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Path\To\RemNoteUpdater.ps1"
-   ```
-   *(Replace `C:\Path\To\` with your actual path)*
+# Remove the scheduled task
+.\RemNoteUpdater.ps1 -Uninstall
+
+# Custom install path and check interval
+.\RemNoteUpdater.ps1 -InstallPath "D:\Apps\RemNote" -CheckIntervalMinutes 30
+```
 
 ## 📊 Logs
 
@@ -187,16 +129,6 @@ Get-Content "$env:LOCALAPPDATA\RemNoteTemp\updater.log" -Tail 50
 ```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
-
-### 7-Zip Not Found
-
-**Error:** "7-Zip not found. Please install 7-Zip."
-
-**Solution:** Install 7-Zip from [https://www.7-zip.org/](https://www.7-zip.org/)
-
-The script checks these locations:
-- `C:\Program Files\7-Zip\7z.exe`
-- `C:\Program Files (x86)\7-Zip\7z.exe`
 
 ### Update Failed - Restoring Backup
 
@@ -235,15 +167,6 @@ Remove-Item "$env:LOCALAPPDATA\RemNoteTemp\last_version.txt"
 - ✅ Rollback mechanism on failure
 - ✅ No elevation/admin rights required or requested
 
-## 📝 File Structure
-
-```
-remnote-updater/
-├── RemNoteUpdater.ps1    # Main updater script
-├── RunUpdater.bat        # Quick launcher (Windows)
-├── README.md             # This file
-└── LICENSE               # MIT License
-```
 
 ## 🤝 Contributing
 
@@ -261,7 +184,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## ⚠️ Disclaimer
 
-This is an unofficial tool and is not affiliated with, endorsed by, or connected to RemNote or RemNote Inc. in any way. Use at your own risk.
+This is an unofficial tool and is not affiliated with, endorsed by, or connected to RemNote or RemNote Inc. in any way.
 
 - This tool downloads RemNote installers from official RemNote servers
 - Always review scripts before running them on your system
@@ -270,7 +193,7 @@ This is an unofficial tool and is not affiliated with, endorsed by, or connected
 ## 🙏 Acknowledgments
 
 - [RemNote](https://www.remnote.com/) - Amazing note-taking and spaced repetition software
-- [7-Zip](https://www.7-zip.org/) - File archiver used for extraction
+- [SharpCompress](https://github.com/adamhathcock/sharpcompress) - File archiver used for extraction
 
 ## 💬 Support
 
