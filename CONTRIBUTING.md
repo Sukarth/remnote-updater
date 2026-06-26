@@ -54,8 +54,7 @@ Enhancement suggestions are tracked as GitHub issues. When creating an enhanceme
 
 ### Testing
 
-Before submitting a PR, test your changes:
-
+Before submitting a PR, please test your changes and ensure the script works. Ex:
 ```powershell
 # Test basic functionality
 .\RemNoteUpdater.ps1 -RunOnce
