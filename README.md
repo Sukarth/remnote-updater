@@ -48,8 +48,15 @@ No files or downloads are required. The script executes in memory, downloads its
 ## Uninstallation
 
 Run the below command in powershell (terminal):
+
 ```powershell
-.\RemNoteUpdater.ps1 -Uninstall
+powershell -ExecutionPolicy Bypass -c '$s=irm https://raw.githubusercontent.com/sukarth/remnote-updater/main/RemNoteUpdater.ps1; & ([scriptblock]::Create($s)) -Uninstall'
+```
+
+Or run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\RemNoteTemp\RemNoteUpdater.ps1" -Uninstall
 ```
 
 This cleanly removes both the Windows Scheduled Task and any Startup folder shortcuts. To fully clean up, delete the `%LOCALAPPDATA%\RemNote` and `%LOCALAPPDATA%\RemNoteTemp` folders.
