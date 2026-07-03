@@ -88,6 +88,23 @@ if (-not $SCRIPT_PATH -or -not (Test-Path $SCRIPT_PATH -PathType Leaf)) {
     }
 }
 
+# Also cache the VBS launcher for silent execution (needed by Register-UpdaterTask)
+$vbsCachePath = Join-Path $TEMP_DIR "BackgroundRemnoteUpdateChecker.vbs"
+if (-not (Test-Path $vbsCachePath)) {
+    try {
+        $webClient2 = New-Object System.Net.WebClient
+        $webClient2.DownloadFile(
+            "https://raw.githubusercontent.com/sukarth/remnote-updater/main/BackgroundRemnoteUpdateChecker.vbs",
+            $vbsCachePath
+        )
+        $webClient2.Dispose()
+        Write-Log "BackgroundRemnoteUpdateChecker.vbs cached successfully."
+    }
+    catch {
+        Write-Log "Failed to cache BackgroundRemnoteUpdateChecker.vbs: $($_.Exception.Message)" "WARN"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 7zr.exe / 7za.exe - portable engine (no install needed).
 # ---------------------------------------------------------------------------
@@ -155,11 +172,13 @@ function Register-UpdaterTask {
     }
     catch {}
 
-    # Tier 1: Attempt standard Register-ScheduledTask Cmdlet (WMI-based)
+    $vbsPath = Join-Path (Split-Path $SCRIPT_PATH) "BackgroundRemnoteUpdateChecker.vbs"
+
+    # Tier 1: Register-ScheduledTask cmdlet, routed through wscript.exe for silent execution
     try {
         $action = New-ScheduledTaskAction `
-            -Execute "powershell.exe" `
-            -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$SCRIPT_PATH`" -RunOnce"
+            -Execute "wscript.exe" `
+            -Argument "`"$vbsPath`""
 
         $logon  = New-ScheduledTaskTrigger -AtLogOn
         $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
@@ -171,7 +190,8 @@ function Register-UpdaterTask {
         $settings = New-ScheduledTaskSettingsSet `
             -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
             -StartWhenAvailable `
-            -RunOnlyIfNetworkAvailable
+            -RunOnlyIfNetworkAvailable `
+            -Hidden
 
         Register-ScheduledTask `
             -TaskName  $TASK_NAME `
@@ -181,21 +201,19 @@ function Register-UpdaterTask {
             -Principal $principal `
             -Force -ErrorAction Stop | Out-Null
 
-        Write-Log "Scheduled task '$TASK_NAME' registered successfully via cmdlet (every $CheckIntervalMinutes min + logon)."
+        Write-Log "Scheduled task '$TASK_NAME' registered successfully via cmdlet (silent, every $CheckIntervalMinutes min + logon)."
         return $true
     }
     catch {
         Write-Log "Task Scheduler cmdlet registration failed ($($_.Exception.Message)). Trying schtasks.exe fallback..." "WARN"
     }
 
-    # Tier 2: Attempt native schtasks.exe (bypasses WMI security, runs as standard user)
+    # Tier 2: schtasks.exe, also routed through wscript.exe
     try {
-        # Native direct execution using the call operator (&) bypasses the Start-Process parser bugs.
-        # Escaping quotes precisely using \" is required so schtasks accepts the /tr argument as a single string.
-        $output = & schtasks.exe /create /f /tn $TASK_NAME /sc minute /mo $CheckIntervalMinutes /tr "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \`"$SCRIPT_PATH\`" -RunOnce" 2>&1
-        
+        $output = & schtasks.exe /create /f /tn $TASK_NAME /sc minute /mo $CheckIntervalMinutes /tr "wscript.exe \`"$vbsPath\`"" 2>&1
+
         if ($LASTEXITCODE -eq 0) {
-            Write-Log "Scheduled task '$TASK_NAME' registered successfully via schtasks.exe (every $CheckIntervalMinutes min)."
+            Write-Log "Scheduled task '$TASK_NAME' registered successfully via schtasks.exe (silent, every $CheckIntervalMinutes min)."
             return $true
         }
         else {
@@ -206,22 +224,22 @@ function Register-UpdaterTask {
         Write-Log "schtasks.exe registration failed: $($_.Exception.Message)" "WARN"
     }
 
-    # Tier 3: Fallback: Startup folder shortcut (no scheduler access required)
+    # Tier 3: Startup folder shortcut, also routed through wscript.exe
     try {
         $startupDir   = [Environment]::GetFolderPath("Startup")
         $shortcutPath = Join-Path $startupDir "RemNoteAutoUpdater.lnk"
 
         $wsh      = New-Object -ComObject WScript.Shell
         $shortcut = $wsh.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath       = "powershell.exe"
-        $shortcut.Arguments        = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$SCRIPT_PATH`" -RunOnce"
+        $shortcut.TargetPath       = "wscript.exe"
+        $shortcut.Arguments        = "`"$vbsPath`""
         $shortcut.WorkingDirectory = Split-Path $SCRIPT_PATH
-        $shortcut.WindowStyle      = 7  # Minimized
+        $shortcut.WindowStyle      = 7
         $shortcut.Description      = "RemNote Auto Updater"
         $shortcut.Save()
 
-        Write-Log "Startup folder shortcut created: $shortcutPath"
-        Write-Log "Updater will run at logon."
+        Write-Log "Startup folder shortcut created (silent): $shortcutPath"
+        Write-Log "Updater will run silently at logon."
         return $true
     }
     catch {
