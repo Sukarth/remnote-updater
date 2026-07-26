@@ -103,9 +103,11 @@ $INSTALLER_DOWNLOAD_URL = "https://backend.remnote.com/desktop/windows"
     - The standalone `7za.exe` engine is present in the repository and its zip if downloaded
     - If running in-memory via the web one-liner (without downloading the repo), the script automatically downloads the **7zr engine**.
 5. Sweeps any active processes running out of the `%LOCALAPPDATA%\RemNote` directory to resolve file locks.
-6. Backs up your current install, deploys the new version, then launches RemNote.
+6. Backs up your current install and deploys the new version.
 7. If RemNote is open when an update is found, a prompt asks whether to update now or later.
 8. Confirms `RemNote.exe` successfully executes post-extraction; if it fails, the script rolls back deployment from the backup directory.
+    - If RemNote was open before the update, it is left running afterwards.
+    - If RemNote was closed, the verification instance is closed again so the update stays invisible.
 9. Cleans up temporary installation files and old backup folders.
 
 ## Manual / advanced usage

@@ -1,4 +1,4 @@
-# RemNote Auto Updater Script v2.0.0
+# RemNote Auto Updater Script v2.0.1
 # Monitors RSS feed for stable releases and auto-updates RemNote
 # Automatic task/startup setup, no admin rights required.
 # Source: https://github.com/sukarth/remnote-updater
@@ -286,7 +286,20 @@ function Get-LatestStableVersion {
     try {
         Write-Log "Checking RSS feed..."
         $response = Invoke-WebRequest -Uri $RSS_FEED_URL -UseBasicParsing -TimeoutSec 30
-        $xml = [xml]$response.Content
+
+        # Decode the body as UTF-8 explicitly. The feed omits a charset header, so the
+        # ISO-8859-1 fallback mangles emoji in release titles - which corrupts the version
+        # string and makes every later comparison mismatch (re-updating on every check).
+        $content = $null
+        try {
+            if ($response.RawContentStream) {
+                $content = [System.Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray())
+            }
+        }
+        catch {}
+        if (-not $content) { $content = $response.Content }
+
+        $xml = [xml]$content
         foreach ($item in $xml.rss.channel.item) {
             $title = $null
             if ($item.title -is [System.Xml.XmlElement]) {
@@ -312,14 +325,22 @@ function Get-LatestStableVersion {
 
 function Get-LastCheckedVersion {
     if (Test-Path $VERSION_FILE) {
-        return (Get-Content $VERSION_FILE -Raw).Trim()
+        # Read as UTF-8 explicitly so titles containing emoji round-trip intact
+        try {
+            return ([System.IO.File]::ReadAllText($VERSION_FILE, [System.Text.Encoding]::UTF8)).Trim()
+        }
+        catch {
+            return (Get-Content $VERSION_FILE -Raw).Trim()
+        }
     }
     return $null
 }
 
 function Save-CurrentVersion {
     param([string]$Version)
-    Set-Content -Path $VERSION_FILE -Value $Version -NoNewline
+    # UTF-8 without BOM. Set-Content defaults to ANSI on PowerShell 5.1, which replaces
+    # emoji with '?' and permanently breaks the comparison against the live feed.
+    [System.IO.File]::WriteAllText($VERSION_FILE, $Version, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 # ---------------------------------------------------------------------------
@@ -615,10 +636,17 @@ function Start-UpdateProcess {
 
     Write-Log "New version detected: $Version - starting update..."
 
+    # Track whether RemNote was in use so the same state can be restored after updating
+    $wasRunning = Test-RemNoteRunning
+    if (-not $wasRunning) {
+        Write-Log "RemNote is not running - it will be closed again after post-update verification."
+    }
+
     $installer = Download-Installer -Version $Version
     if (-not $installer) { return $false }
 
     if (Test-RemNoteRunning) {
+        $wasRunning = $true
         $result = Show-UpdatePrompt
         if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
             Write-Log "User deferred update."
@@ -635,6 +663,7 @@ function Start-UpdateProcess {
         return $false
     }
 
+    # Launch once regardless of prior state - this is the post-update integrity check
     Start-RemNote | Out-Null
 
     # Wait and verify that the updated binary initializes successfully
@@ -645,9 +674,18 @@ function Start-UpdateProcess {
             Stop-RemNote | Out-Null
             Remove-Item $INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue
             Rename-Item -Path $BACKUP_DIR -NewName (Split-Path $INSTALL_DIR -Leaf) -ErrorAction SilentlyContinue
-            Start-RemNote | Out-Null
+            # Only bring RemNote back up if the user actually had it open
+            if ($wasRunning) { Start-RemNote | Out-Null }
         }
         return $false
+    }
+
+    # RemNote was closed before the update, so leave it closed once verification passes
+    if (-not $wasRunning) {
+        Write-Log "Verification passed - closing the RemNote instance started for verification."
+        if (-not (Stop-RemNote)) {
+            Write-Log "Could not close the verification instance of RemNote." "WARN"
+        }
     }
 
     Save-CurrentVersion -Version $Version
@@ -662,7 +700,7 @@ function Start-UpdateProcess {
 }
 
 function Start-Monitoring {
-    Write-Log "RemNote Auto Updater v2.0.0 started"
+    Write-Log "RemNote Auto Updater v2.0.1 started"
     Trim-Log
 
     # Seed the tracker value unless -Force is specified to avoid redundant installs for existing setups

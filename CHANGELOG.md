@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-07-26
+
+### Changed
+- **State-Preserving Launch**: RemNote is no longer left running after a background update if it was closed beforehand. The updated binary is still launched once for the post-extraction integrity check, then shut down again, so silent updates no longer pop the app open unexpectedly. If RemNote *was* open when the update ran, it is relaunched and left running as before (including on rollback).
+
+### Fixed
+- **Repeating Update Loop (UTF-8 Version Tracking)**: Release titles containing emoji were corrupted twice over - the RSS body was decoded as ISO-8859-1 (no charset header on the feed), and `Set-Content` then wrote it as ANSI, replacing the emoji with `?`. The stored version could therefore never match the live feed, so every scheduled check re-extracted, redeployed and relaunched RemNote. The feed is now decoded as UTF-8 explicitly and the tracker file is read/written as UTF-8 without BOM.
+
+---
+
 ## [2.0.0] - 2026-06-26
 
 ### Added
@@ -64,4 +74,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [1.0.0]: https://github.com/sukarth/remnote-updater/releases/tag/v1.0.0
 [2.0.0]: https://github.com/sukarth/remnote-updater/releases/tag/v2.0.0
+[2.0.1]: https://github.com/sukarth/remnote-updater/releases/tag/v2.0.1
 ```
