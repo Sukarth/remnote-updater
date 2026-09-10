@@ -544,8 +544,11 @@ function Clear-DeferredUpdate {
 # An exclusively-opened file rather than a named mutex. A "Local\" mutex is scoped to one
 # Windows session, so a console and an RDP session of the same user would each hold their
 # own and both could deploy at once; a single global name would go the other way and make
-# two updaters pointed at different -InstallPath values block each other. The lock file
-# sits beside the installation this run manages, which is exactly the resource at stake.
+# two updaters running against separate -TempPath state block each other for no reason.
+# The lock lives in $TEMP_DIR, so it serialises exactly the runs that share the installer
+# cache, the nsis_extract staging directory and the tracker - which is the state two
+# concurrent runs actually corrupt. Runs sharing an -InstallPath but given different
+# -TempPath values are not serialised; that combination has to be asked for explicitly.
 # Windows releases the handle when the process dies, so a crash cannot leave it stuck.
 $script:LockUnavailableReason = $null
 
