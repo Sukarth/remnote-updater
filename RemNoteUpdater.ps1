@@ -35,13 +35,9 @@ $TEMP_DIR               = $TempPath
 $VERSION_FILE           = Join-Path $TEMP_DIR "last_version.txt"
 $LOG_FILE               = Join-Path $TEMP_DIR "updater.log"
 $DEFER_FILE             = Join-Path $TEMP_DIR "deferred_version.txt"
+$LOCK_FILE              = Join-Path $TEMP_DIR "updater.lock"
 $TASK_NAME              = "RemNoteAutoUpdater"
 $SCRIPT_PATH            = $MyInvocation.MyCommand.Path
-
-# Session-scoped single-instance lock. The scheduled task fires wscript.exe, which starts
-# PowerShell detached and exits immediately, so Task Scheduler's own "IgnoreNew" policy
-# never sees the real worker - overlapping runs have to be blocked in-script.
-$MUTEX_NAME             = "Local\RemNoteAutoUpdater_SingleInstance"
 
 # How long a "Later" click suppresses re-prompting for the same version.
 $DEFER_HOURS            = 6
@@ -62,12 +58,18 @@ function Write-Log {
     $msg = "[$ts] [$Level] $Message"
     Write-Host $msg
     # Append as UTF-8; Add-Content's ANSI default turned emoji in feed titles into "?".
+    $written = $false
     for ($i = 0; $i -lt 3; $i++) {
         try {
             [System.IO.File]::AppendAllText($LOG_FILE, $msg + [Environment]::NewLine, $script:Utf8NoBom)
+            $written = $true
             break
         }
         catch { Start-Sleep -Milliseconds 100 }
+    }
+    if (-not $written) {
+        # Say so on the console rather than losing the entry without a trace.
+        Write-Host "[$ts] [WARN] Could not write to $LOG_FILE - the line above was not recorded."
     }
 }
 
@@ -231,16 +233,79 @@ function Register-UpdaterTask {
         Write-Log "Task Scheduler cmdlet registration failed ($($_.Exception.Message)). Trying schtasks.exe fallback..." "WARN"
     }
 
-    # Tier 2: schtasks.exe, also routed through wscript.exe
+    # Tier 2: schtasks.exe, also routed through wscript.exe. Registered from task XML
+    # rather than "/sc minute", because the command-line form cannot express the battery,
+    # hidden or logon-trigger settings that Tier 1 sets - a task created that way inherits
+    # Windows' default "do not start on batteries" and stops checking on any unplugged
+    # laptop, which is the exact problem Tier 1 fixes.
     try {
-        $output = & schtasks.exe /create /f /tn $TASK_NAME /sc minute /mo $CheckIntervalMinutes /tr "wscript.exe \`"$vbsPath\`"" 2>&1
+        $xmlPath  = Join-Path $TEMP_DIR "RemNoteAutoUpdaterTask.xml"
+        $start    = (Get-Date).AddMinutes(1).ToString("yyyy-MM-ddTHH:mm:ss")
+        $xmlUser  = [System.Security.SecurityElement]::Escape([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+        $xmlVbs   = [System.Security.SecurityElement]::Escape("`"$vbsPath`"")
 
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log "Scheduled task '$TASK_NAME' registered successfully via schtasks.exe (silent, every $CheckIntervalMinutes min)."
+        $taskXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>RemNote Auto Updater</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>$xmlUser</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>$start</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT${CheckIntervalMinutes}M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$xmlUser</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>wscript.exe</Command>
+      <Arguments>$xmlVbs</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+
+        # schtasks /xml only accepts a Unicode (UTF-16) file.
+        [System.IO.File]::WriteAllText($xmlPath, $taskXml, (New-Object System.Text.UnicodeEncoding($false, $true)))
+
+        $output = & schtasks.exe /create /f /tn $TASK_NAME /xml "$xmlPath" 2>&1
+        $code   = $LASTEXITCODE
+        Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+
+        if ($code -eq 0) {
+            Write-Log "Scheduled task '$TASK_NAME' registered successfully via schtasks.exe (silent, every $CheckIntervalMinutes min + logon)."
             return $true
         }
         else {
-            Write-Log "schtasks.exe failed with exit code $LASTEXITCODE. Output: $output" "WARN"
+            Write-Log "schtasks.exe failed with exit code $code. Output: $output" "WARN"
         }
     }
     catch {
@@ -321,6 +386,11 @@ function ConvertTo-NormalizedVersion {
 function Format-VersionText {
     param($Version)
     if (-not $Version) { return "unknown" }
+    # Keep the fourth component only when it carries information. Ordinary three-part
+    # releases still read as "1.28.18", while a published "1.28.18.1" survives intact -
+    # truncating it here would make it compare equal to an installed 1.28.18 and the
+    # release would never be picked up.
+    if ($Version.Revision -gt 0) { return $Version.ToString(4) }
     return $Version.ToString(3)
 }
 
@@ -394,17 +464,23 @@ function Get-LatestStableVersion {
 # What is actually on disk. backend.remnote.com always serves the current build, which can
 # run ahead of the changelog feed (a feed entry of 1.28.18 shipped a 1.28.19 binary), so
 # the binary itself is the only trustworthy record of the installed version.
-function Get-InstalledVersion {
+function Get-BinaryVersion {
     $exe = Join-Path $INSTALL_DIR "RemNote.exe"
-    if (Test-Path $exe) {
-        try {
-            $v = ConvertTo-NormalizedVersion (Get-Item $exe).VersionInfo.FileVersion
-            if ($v) { return $v }
-        }
-        catch {}
-    }
+    if (-not (Test-Path $exe)) { return $null }
+    try { return (ConvertTo-NormalizedVersion (Get-Item $exe).VersionInfo.FileVersion) }
+    catch { return $null }
+}
 
-    # Fall back to the tracker file written by earlier versions of this script.
+function Get-InstalledVersion {
+    # No binary means nothing is installed, whatever the tracker still claims. Returning a
+    # stale tracker value here would leave a deleted or broken installation unrepaired.
+    if (-not (Test-Path (Join-Path $INSTALL_DIR "RemNote.exe") -PathType Leaf)) { return $null }
+
+    $v = Get-BinaryVersion
+    if ($v) { return $v }
+
+    # The binary is there but its metadata is unreadable - fall back to the tracker file
+    # written by earlier versions of this script rather than reinstalling blindly.
     return (ConvertTo-NormalizedVersion (Get-LastCheckedVersion))
 }
 
@@ -450,12 +526,45 @@ function Save-DeferredUpdate {
     try {
         $stamp = (Get-Date).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
         [System.IO.File]::WriteAllText($DEFER_FILE, "$Version|$stamp", $script:Utf8NoBom)
+        return $true
     }
-    catch {}
+    catch {
+        Write-Log "Could not record the deferral - $($_.Exception.Message)" "WARN"
+        return $false
+    }
 }
 
 function Clear-DeferredUpdate {
     Remove-Item $DEFER_FILE -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# Single-Instance Lock
+# ---------------------------------------------------------------------------
+# An exclusively-opened file rather than a named mutex. A "Local\" mutex is scoped to one
+# Windows session, so a console and an RDP session of the same user would each hold their
+# own and both could deploy at once; a single global name would go the other way and make
+# two updaters pointed at different -InstallPath values block each other. The lock file
+# sits beside the installation this run manages, which is exactly the resource at stake.
+# Windows releases the handle when the process dies, so a crash cannot leave it stuck.
+$script:LockUnavailableReason = $null
+
+function Enter-SingleInstanceLock {
+    try {
+        return [System.IO.File]::Open(
+            $LOCK_FILE,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None)
+    }
+    catch [System.IO.IOException] {
+        $script:LockUnavailableReason = "another updater instance is already running"
+        return $null
+    }
+    catch {
+        $script:LockUnavailableReason = "the lock file $LOCK_FILE could not be opened - $($_.Exception.Message)"
+        return $null
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -781,8 +890,12 @@ function Start-UpdateProcess {
         $wasRunning = $true
         $result = Show-UpdatePrompt -Version $Version
         if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
-            Write-Log "User deferred update to $Version for $DEFER_HOURS hours."
-            Save-DeferredUpdate -Version $Version
+            if (Save-DeferredUpdate -Version $Version) {
+                Write-Log "User deferred update to $Version for $DEFER_HOURS hours."
+            }
+            else {
+                Write-Log "User deferred update to $Version, but the deferral could not be saved - the next check will ask again." "WARN"
+            }
             return $false
         }
         if (-not (Stop-RemNote)) {
@@ -823,9 +936,18 @@ function Start-UpdateProcess {
 
     # Record what actually landed on disk, not what the feed advertised - the served build
     # is frequently a revision or two ahead of the changelog entry that triggered it.
-    $installedNow = Get-InstalledVersion
-    if ($installedNow) { Save-CurrentVersion -Version (Format-VersionText $installedNow) }
-    else               { Save-CurrentVersion -Version $Version }
+    # Read the binary directly rather than through Get-InstalledVersion: its tracker
+    # fallback would write the pre-update value straight back, leaving the installation
+    # permanently "behind" and re-running this whole pipeline on every check.
+    $installedNow = Get-BinaryVersion
+    $reported     = $Version
+    if ($installedNow) {
+        $reported = Format-VersionText $installedNow
+    }
+    else {
+        Write-Log "Could not read the version of the deployed RemNote.exe - recording the published $Version instead." "WARN"
+    }
+    Save-CurrentVersion -Version $reported
     Clear-DeferredUpdate
 
     if (Test-Path $BACKUP_DIR) {
@@ -833,7 +955,7 @@ function Start-UpdateProcess {
         Write-Log "Backup folder cleared."
     }
 
-    Write-Log "RemNote updated to $(Format-VersionText $installedNow) successfully (changelog entry $Version)."
+    Write-Log "RemNote updated to $reported successfully (changelog entry $Version)."
     return $true
 }
 
@@ -879,8 +1001,7 @@ function Start-Monitoring {
 # ---------------------------------------------------------------------------
 # Orchestration / Entry Point
 # ---------------------------------------------------------------------------
-$script:Mutex      = $null
-$script:MutexOwned = $false
+$script:Lock = $null
 
 try {
     if ($Uninstall) {
@@ -892,18 +1013,12 @@ try {
     # trigger overlap in practice: two runs once raced each other through the same download,
     # showed two update prompts, and one of them carried on after the user clicked "Later".
     # Concurrent extraction is worse - both instances shuffle $INSTALL_DIR and $BACKUP_DIR.
-    try {
-        $script:Mutex = New-Object System.Threading.Mutex($false, $MUTEX_NAME)
-        try { $script:MutexOwned = $script:Mutex.WaitOne(0) }
-        catch [System.Threading.AbandonedMutexException] { $script:MutexOwned = $true }
-
-        if (-not $script:MutexOwned) {
-            Write-Log "Another updater instance is already running - exiting."
-            exit 0
-        }
-    }
-    catch {
-        Write-Log "Could not acquire single-instance lock: $($_.Exception.Message)" "WARN"
+    # If the lock cannot be taken for any reason, stop: running unprotected is the very
+    # failure this guards against, and the next scheduled check will try again.
+    $script:Lock = Enter-SingleInstanceLock
+    if (-not $script:Lock) {
+        Write-Log "Not starting - $script:LockUnavailableReason."
+        exit 0
     }
 
     if ($Force) {
@@ -949,10 +1064,9 @@ catch {
     Write-Log "Critical error: $($_.Exception.Message)" "ERROR"
 }
 finally {
-    if ($script:MutexOwned) {
-        try { $script:Mutex.ReleaseMutex() } catch {}
-    }
-    if ($script:Mutex) {
-        try { $script:Mutex.Dispose() } catch {}
+    # Closing the handle releases the lock. The empty file is left behind deliberately -
+    # deleting it would race another instance that is opening it right now.
+    if ($script:Lock) {
+        try { $script:Lock.Dispose() } catch {}
     }
 }
