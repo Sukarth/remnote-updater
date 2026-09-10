@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-09-10
+
+### Fixed
+- **Missed Releases (Pinned Announcement Posts)**: Version detection read only the *first* entry of the changelog feed and treated its title as a version string. The feed mixes release entries (`1.28.18`) with announcement posts (`🎉 RemNote 1.28: Faster, Smoother, Smarter 🎉`), and those posts get pinned to the top. While one was pinned, the updater compared the announcement title against itself, reported "Already up to date" on every check, and silently skipped every real release published behind it (`1.28.4` through `1.28.7` were missed for roughly two weeks). Every entry in the feed is now scanned, only titles that are *nothing but* a version number are accepted as releases, and the highest one wins.
+- **Installed Version Is Now Read From the Binary**: Update decisions compared the feed title against a text tracker file, which never described what was actually installed. `backend.remnote.com` always serves the current build, which regularly runs ahead of the changelog (a feed entry of `1.28.18` ships a `1.28.19` binary), so the tracker drifted permanently out of sync. The installed version is now taken from `RemNote.exe`'s `FileVersion`, compared numerically (not as strings), and the tracker file records what actually landed on disk. The old tracker is still read as a fallback for installs that predate this release.
+- **Overlapping Updater Instances**: The logon trigger and the hourly repetition trigger overlap in practice, and because the scheduled task launches PowerShell detached through `wscript.exe`, Task Scheduler's own `IgnoreNew` policy never saw the real worker. Two instances raced through the same update: both prompted, and the one the user did *not* click "Later" on carried on and updated anyway. Worse, two concurrent extractions would shuffle `%LOCALAPPDATA%\RemNote` and its backup directory at the same time. A lock file in the temp directory, opened for exclusive access, now admits exactly one instance. It is a file rather than a named mutex so that the lock spans Windows sessions — a console and an RDP session of the same user share one installation, but a `Local\` mutex would give each its own. The lock lives in the temp directory, so it serialises exactly the runs that share the installer cache, the extraction staging directory and the tracker file, while a run given its own `-TempPath` stays independent. If the lock cannot be taken for any reason the run stops rather than continuing unprotected.
+- **"Later" Is Remembered**: Deferring an update only skipped that single check - the next trigger (as little as minutes later, or the next logon) re-prompted immediately, and re-downloaded the 300+ MB installer to do it. A deferral is now recorded and suppresses re-prompting for that version for 6 hours. It is checked before downloading, and it only applies while RemNote is open; once RemNote is closed the update proceeds silently as before.
+- **Blank Extraction Errors**: The extraction failure handler logged `$_.Message`, which is always empty on an `ErrorRecord`, so the reason a deployment failed was never recorded. It now logs `$_.Exception.Message`.
+- **Task Skipped on Battery**: Newly registered scheduled tasks inherited Windows' default "do not start on batteries" setting, which silently suppressed update checks on any unplugged laptop. Tasks are now registered with `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`. The `schtasks.exe` fallback registers from task XML instead of `/sc minute`, since the command-line form cannot express those settings — it also gains the hidden flag and logon trigger that only the cmdlet path had.
+- **Log File Encoding**: `Add-Content` wrote the log as ANSI on PowerShell 5.1, turning emoji in feed titles into `?`. The log is now written as UTF-8 throughout, including during rotation.
+
+### Changed
+- **Update Prompt**: The dialog now names the version being offered and describes what each button does - "Update Now" closes and reopens RemNote itself, so the old "Please close RemNote to continue" instruction was misleading.
+- **Clearer Status Logging**: Up-to-date checks now log both sides of the comparison (`Already up to date: installed 1.28.19, latest published 1.28.18`), and a successful update reports the version actually installed alongside the changelog entry that triggered it.
+
+---
+
 ## [2.0.1] - 2026-07-26
 
 ### Changed
@@ -73,6 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 [1.0.0]: https://github.com/sukarth/remnote-updater/releases/tag/v1.0.0
+[2.1.0]: https://github.com/sukarth/remnote-updater/releases/tag/v2.1.0
 [2.0.0]: https://github.com/sukarth/remnote-updater/releases/tag/v2.0.0
 [2.0.1]: https://github.com/sukarth/remnote-updater/releases/tag/v2.0.1
 ```
