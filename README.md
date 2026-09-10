@@ -96,15 +96,15 @@ $INSTALLER_DOWNLOAD_URL = "https://backend.remnote.com/desktop/windows"
 
 ## 🔄 How It Works
 
-1. Reads the [RemNote changelog RSS feed](https://feedback.remnote.com/rss/changelog.xml) — skips beta versions.
-2. If a new stable version is found, downloads the installer from official RemNote servers.
+1. Reads the [RemNote changelog RSS feed](https://feedback.remnote.com/rss/changelog.xml) — scans every entry and takes the highest release number, skipping beta versions and announcement posts.
+2. Compares it against the version of the `RemNote.exe` you actually have installed. If the feed is ahead, downloads the installer from official RemNote servers.
 3. Verifies file integrity using a local SHA256 sidecar file.
 4. Extracts the app silently using 7-Zip
     - The standalone `7za.exe` engine is present in the repository and its zip if downloaded
     - If running in-memory via the web one-liner (without downloading the repo), the script automatically downloads the **7zr engine**.
 5. Sweeps any active processes running out of the `%LOCALAPPDATA%\RemNote` directory to resolve file locks.
 6. Backs up your current install and deploys the new version.
-7. If RemNote is open when an update is found, a prompt asks whether to update now or later.
+7. If RemNote is open when an update is found, a prompt asks whether to update now or later. Choosing **Later** postpones that version for 6 hours — or until you close RemNote, at which point the update installs silently.
 8. Confirms `RemNote.exe` successfully executes post-extraction; if it fails, the script rolls back deployment from the backup directory.
     - If RemNote was open before the update, it is left running afterwards.
     - If RemNote was closed, the verification instance is closed again so the update stays invisible.
@@ -167,17 +167,18 @@ Rename-Item "$env:LOCALAPPDATA\RemNote_Backup" "RemNote"
 
 ### Check Current Version
 
-View the last installed version:
+View the installed version — this is what the updater itself compares against:
 ```powershell
-Get-Content "$env:LOCALAPPDATA\RemNoteTemp\last_version.txt"
+(Get-Item "$env:LOCALAPPDATA\RemNote\RemNote.exe").VersionInfo.FileVersion
 ```
+
+Note that the build served by RemNote's download endpoint is often a revision or two ahead of the newest changelog entry, so the installed version being *higher* than the feed is normal.
 
 ### Force Re-Download
 
-Delete the version file to force a fresh download:
+Use `-Force` to ignore the cached installer and reinstall the latest build regardless of what is installed:
 ```powershell
-Remove-Item "$env:LOCALAPPDATA\RemNoteTemp\last_version.txt"
-.\RemNoteUpdater.ps1 -RunOnce
+.\RemNoteUpdater.ps1 -RunOnce -Force
 ```
 
 ## 🔐 Security

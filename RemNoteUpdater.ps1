@@ -1,4 +1,4 @@
-# RemNote Auto Updater Script v2.0.1
+# RemNote Auto Updater Script v2.1.0
 # Monitors RSS feed for stable releases and auto-updates RemNote
 # Automatic task/startup setup, no admin rights required.
 # Source: https://github.com/sukarth/remnote-updater
@@ -34,8 +34,20 @@ $BACKUP_DIR             = "${InstallPath}_Backup"
 $TEMP_DIR               = $TempPath
 $VERSION_FILE           = Join-Path $TEMP_DIR "last_version.txt"
 $LOG_FILE               = Join-Path $TEMP_DIR "updater.log"
+$DEFER_FILE             = Join-Path $TEMP_DIR "deferred_version.txt"
 $TASK_NAME              = "RemNoteAutoUpdater"
 $SCRIPT_PATH            = $MyInvocation.MyCommand.Path
+
+# Session-scoped single-instance lock. The scheduled task fires wscript.exe, which starts
+# PowerShell detached and exits immediately, so Task Scheduler's own "IgnoreNew" policy
+# never sees the real worker - overlapping runs have to be blocked in-script.
+$MUTEX_NAME             = "Local\RemNoteAutoUpdater_SingleInstance"
+
+# How long a "Later" click suppresses re-prompting for the same version.
+$DEFER_HOURS            = 6
+
+# UTF-8 without BOM everywhere. PowerShell 5.1 defaults to ANSI, which mangles feed titles.
+$script:Utf8NoBom       = New-Object System.Text.UTF8Encoding($false)
 
 if (-not (Test-Path $TEMP_DIR)) {
     New-Item -ItemType Directory -Path $TEMP_DIR -Force | Out-Null
@@ -49,15 +61,22 @@ function Write-Log {
     $ts  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $msg = "[$ts] [$Level] $Message"
     Write-Host $msg
-    Add-Content -Path $LOG_FILE -Value $msg
+    # Append as UTF-8; Add-Content's ANSI default turned emoji in feed titles into "?".
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            [System.IO.File]::AppendAllText($LOG_FILE, $msg + [Environment]::NewLine, $script:Utf8NoBom)
+            break
+        }
+        catch { Start-Sleep -Milliseconds 100 }
+    }
 }
 
 function Trim-Log {
     if (Test-Path $LOG_FILE) {
         try {
-            $lines = Get-Content $LOG_FILE -ErrorAction SilentlyContinue
-            if ($lines -and $lines.Count -gt 500) {
-                $lines | Select-Object -Last 500 | Set-Content $LOG_FILE -Force
+            $lines = @(Get-Content $LOG_FILE -Encoding UTF8 -ErrorAction SilentlyContinue)
+            if ($lines.Count -gt 500) {
+                [System.IO.File]::WriteAllLines($LOG_FILE, [string[]]($lines | Select-Object -Last 500), $script:Utf8NoBom)
             }
         }
         catch {}
@@ -187,10 +206,14 @@ function Register-UpdaterTask {
         $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $principal   = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive
 
+        # AllowStartIfOnBatteries / DontStopIfGoingOnBatteries: without these the task is
+        # silently skipped on any unplugged laptop, which is most of the target audience.
         $settings = New-ScheduledTaskSettingsSet `
             -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
             -StartWhenAvailable `
             -RunOnlyIfNetworkAvailable `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
             -Hidden
 
         Register-ScheduledTask `
@@ -282,6 +305,47 @@ function Unregister-UpdaterTask {
 # ---------------------------------------------------------------------------
 # Version Check & Feed Processing
 # ---------------------------------------------------------------------------
+# Parse the leading dotted number out of arbitrary text and pad it to four components,
+# so feed strings ("1.28.18") and binary FileVersion strings ("1.28.19") compare directly.
+function ConvertTo-NormalizedVersion {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    $m = [regex]::Match($Text.Trim(), '\d+(?:\.\d+){1,3}')
+    if (-not $m.Success) { return $null }
+    $parts = @($m.Value -split '\.')
+    while ($parts.Count -lt 4) { $parts += '0' }
+    try { return [version]($parts -join '.') }
+    catch { return $null }
+}
+
+function Format-VersionText {
+    param($Version)
+    if (-not $Version) { return "unknown" }
+    return $Version.ToString(3)
+}
+
+# The changelog feed mixes release entries ("1.28.18") with pinned announcement posts
+# ("RemNote 1.28: Faster, Smoother, Smarter"). Only a title that is *nothing but* a
+# version number is a release - anything else is editorial and must not be treated as one.
+function ConvertTo-ReleaseVersion {
+    param([string]$Title)
+    if (-not $Title) { return $null }
+    $t = $Title.Trim()
+    if ($t -match '\(Beta\)') { return $null }
+    if ($t -notmatch '^v?\d+(?:\.\d+){1,3}$') { return $null }
+    return ConvertTo-NormalizedVersion $t
+}
+
+function Get-FeedItemTitle {
+    param($Item)
+    if ($Item.title -is [System.Xml.XmlElement]) {
+        $t = $Item.title.'#cdata-section'
+        if (-not $t) { $t = $Item.title.InnerText }
+        return $t
+    }
+    return $Item.title
+}
+
 function Get-LatestStableVersion {
     try {
         Write-Log "Checking RSS feed..."
@@ -300,27 +364,48 @@ function Get-LatestStableVersion {
         if (-not $content) { $content = $response.Content }
 
         $xml = [xml]$content
-        foreach ($item in $xml.rss.channel.item) {
-            $title = $null
-            if ($item.title -is [System.Xml.XmlElement]) {
-                $title = $item.title.'#cdata-section'
-                if (-not $title) { $title = $item.title.InnerText }
-            } else {
-                $title = $item.title
-            }
 
-            if ($title -and $title -notmatch '\(Beta\)') {
-                Write-Log "Latest stable: $($title.Trim())"
-                return $title.Trim()
-            }
+        # Scan every entry and keep the highest version rather than trusting item[0].
+        # The feed is not reliably ordered: announcement posts get pinned to the top and
+        # pubDate ordering slips, so reading only the first entry silently hides real
+        # releases sitting further down the list.
+        $best    = $null
+        $skipped = 0
+        foreach ($item in $xml.rss.channel.item) {
+            $v = ConvertTo-ReleaseVersion -Title (Get-FeedItemTitle -Item $item)
+            if (-not $v) { $skipped++; continue }
+            if (-not $best -or $v -gt $best) { $best = $v }
         }
-        Write-Log "No stable release found in RSS." "WARN"
-        return $null
+
+        if (-not $best) {
+            Write-Log "No release version found in RSS ($skipped non-release entries)." "WARN"
+            return $null
+        }
+
+        Write-Log "Latest stable: $(Format-VersionText $best)"
+        return (Format-VersionText $best)
     }
     catch {
         Write-Log "RSS fetch error: $($_.Exception.Message)" "ERROR"
         return $null
     }
+}
+
+# What is actually on disk. backend.remnote.com always serves the current build, which can
+# run ahead of the changelog feed (a feed entry of 1.28.18 shipped a 1.28.19 binary), so
+# the binary itself is the only trustworthy record of the installed version.
+function Get-InstalledVersion {
+    $exe = Join-Path $INSTALL_DIR "RemNote.exe"
+    if (Test-Path $exe) {
+        try {
+            $v = ConvertTo-NormalizedVersion (Get-Item $exe).VersionInfo.FileVersion
+            if ($v) { return $v }
+        }
+        catch {}
+    }
+
+    # Fall back to the tracker file written by earlier versions of this script.
+    return (ConvertTo-NormalizedVersion (Get-LastCheckedVersion))
 }
 
 function Get-LastCheckedVersion {
@@ -340,7 +425,37 @@ function Save-CurrentVersion {
     param([string]$Version)
     # UTF-8 without BOM. Set-Content defaults to ANSI on PowerShell 5.1, which replaces
     # emoji with '?' and permanently breaks the comparison against the live feed.
-    [System.IO.File]::WriteAllText($VERSION_FILE, $Version, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($VERSION_FILE, $Version, $script:Utf8NoBom)
+}
+
+# ---------------------------------------------------------------------------
+# Deferral State ("Later" has to survive until the next scheduled check)
+# ---------------------------------------------------------------------------
+function Get-DeferredUpdate {
+    if (-not (Test-Path $DEFER_FILE)) { return $null }
+    try {
+        $raw   = ([System.IO.File]::ReadAllText($DEFER_FILE, [System.Text.Encoding]::UTF8)).Trim()
+        $parts = $raw -split '\|', 2
+        if ($parts.Count -ne 2) { return $null }
+        return [pscustomobject]@{
+            Version = $parts[0]
+            At      = [datetime]::Parse($parts[1], [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    catch { return $null }
+}
+
+function Save-DeferredUpdate {
+    param([string]$Version)
+    try {
+        $stamp = (Get-Date).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+        [System.IO.File]::WriteAllText($DEFER_FILE, "$Version|$stamp", $script:Utf8NoBom)
+    }
+    catch {}
+}
+
+function Clear-DeferredUpdate {
+    Remove-Item $DEFER_FILE -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
@@ -509,7 +624,7 @@ function Extract-Installer {
         return $true
     }
     catch {
-        Write-Log "Extraction pipeline error: $($_.Message)" "ERROR"
+        Write-Log "Extraction pipeline error: $($_.Exception.Message)" "ERROR"
         if (Test-Path $BACKUP_DIR) {
             Remove-Item $INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue
             Rename-Item -Path $BACKUP_DIR -NewName (Split-Path $INSTALL_DIR -Leaf) -ErrorAction SilentlyContinue
@@ -554,6 +669,8 @@ function Close-FolderProcesses {
 }
 
 function Show-UpdatePrompt {
+    param([string]$Version)
+
     Add-Type -AssemblyName System.Windows.Forms
 
     $form                 = New-Object System.Windows.Forms.Form
@@ -567,7 +684,7 @@ function Show-UpdatePrompt {
     $lbl          = New-Object System.Windows.Forms.Label
     $lbl.Location = New-Object System.Drawing.Point(20, 20)
     $lbl.Size     = New-Object System.Drawing.Size(380, 70)
-    $lbl.Text     = "A new version of RemNote is available.`n`nPlease close RemNote to continue, or click Later to skip this check."
+    $lbl.Text     = "RemNote $Version is available.`n`nUpdate Now closes RemNote, installs the update and reopens it.`nLater postpones this update for $DEFER_HOURS hours."
     $form.Controls.Add($lbl)
 
     $btnNow              = New-Object System.Windows.Forms.Button
@@ -642,14 +759,30 @@ function Start-UpdateProcess {
         Write-Log "RemNote is not running - it will be closed again after post-update verification."
     }
 
+    # A "Later" click only matters while RemNote is open; once it is closed the update can
+    # proceed silently. Checked before downloading so a deferral does not cost 300+ MB on
+    # every scheduled check.
+    if ($wasRunning -and -not $Force) {
+        $deferred = Get-DeferredUpdate
+        if ($deferred -and $deferred.Version -eq $Version) {
+            $elapsed = (Get-Date) - $deferred.At
+            if ($elapsed.TotalHours -lt $DEFER_HOURS) {
+                $remaining = [math]::Round($DEFER_HOURS - $elapsed.TotalHours, 1)
+                Write-Log "Update to $Version was deferred by the user - waiting another $remaining h."
+                return $false
+            }
+        }
+    }
+
     $installer = Download-Installer -Version $Version
     if (-not $installer) { return $false }
 
     if (Test-RemNoteRunning) {
         $wasRunning = $true
-        $result = Show-UpdatePrompt
+        $result = Show-UpdatePrompt -Version $Version
         if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
-            Write-Log "User deferred update."
+            Write-Log "User deferred update to $Version for $DEFER_HOURS hours."
+            Save-DeferredUpdate -Version $Version
             return $false
         }
         if (-not (Stop-RemNote)) {
@@ -688,41 +821,49 @@ function Start-UpdateProcess {
         }
     }
 
-    Save-CurrentVersion -Version $Version
+    # Record what actually landed on disk, not what the feed advertised - the served build
+    # is frequently a revision or two ahead of the changelog entry that triggered it.
+    $installedNow = Get-InstalledVersion
+    if ($installedNow) { Save-CurrentVersion -Version (Format-VersionText $installedNow) }
+    else               { Save-CurrentVersion -Version $Version }
+    Clear-DeferredUpdate
 
     if (Test-Path $BACKUP_DIR) {
         Remove-Item $BACKUP_DIR -Recurse -Force -ErrorAction SilentlyContinue
         Write-Log "Backup folder cleared."
     }
 
-    Write-Log "RemNote updated to $Version successfully."
+    Write-Log "RemNote updated to $(Format-VersionText $installedNow) successfully (changelog entry $Version)."
     return $true
 }
 
 function Start-Monitoring {
-    Write-Log "RemNote Auto Updater v2.0.1 started"
+    Write-Log "RemNote Auto Updater v2.1.0 started"
     Trim-Log
-
-    # Seed the tracker value unless -Force is specified to avoid redundant installs for existing setups
-    if (-not $Force -and (Test-Path (Join-Path $INSTALL_DIR "RemNote.exe")) -and -not (Test-Path $VERSION_FILE)) {
-        Write-Log "RemNote is installed but local tracker is missing. Querying feed..."
-        $latest = Get-LatestStableVersion
-        if ($latest) {
-            Save-CurrentVersion -Version $latest
-            Write-Log "Tracker initialized to $latest."
-        }
-    }
 
     do {
         $latest = Get-LatestStableVersion
         if ($latest) {
-            $last = Get-LastCheckedVersion
-            # Always run the update pipeline if -Force is checked
-            if ($Force -or ($last -ne $latest)) {
+            $latestVersion    = ConvertTo-NormalizedVersion $latest
+            $installedVersion = Get-InstalledVersion
+
+            # Compare versions numerically against the installed binary. The old string
+            # comparison against a tracker file treated any change in the feed's top entry
+            # as an update, and any repeat of it as "up to date" - so a pinned announcement
+            # post at the top of the feed hid every real release behind it.
+            if ($Force) {
+                Start-UpdateProcess -Version $latest | Out-Null
+            }
+            elseif (-not $installedVersion) {
+                Write-Log "No RemNote installation detected - installing $latest."
+                Start-UpdateProcess -Version $latest | Out-Null
+            }
+            elseif ($latestVersion -gt $installedVersion) {
+                Write-Log "Installed $(Format-VersionText $installedVersion) is behind published $latest."
                 Start-UpdateProcess -Version $latest | Out-Null
             }
             else {
-                Write-Log "Already up to date: $latest"
+                Write-Log "Already up to date: installed $(Format-VersionText $installedVersion), latest published $latest"
             }
         }
 
@@ -738,10 +879,31 @@ function Start-Monitoring {
 # ---------------------------------------------------------------------------
 # Orchestration / Entry Point
 # ---------------------------------------------------------------------------
+$script:Mutex      = $null
+$script:MutexOwned = $false
+
 try {
     if ($Uninstall) {
         Unregister-UpdaterTask
         exit 0
+    }
+
+    # Refuse to run alongside another instance. The logon trigger and the hourly repetition
+    # trigger overlap in practice: two runs once raced each other through the same download,
+    # showed two update prompts, and one of them carried on after the user clicked "Later".
+    # Concurrent extraction is worse - both instances shuffle $INSTALL_DIR and $BACKUP_DIR.
+    try {
+        $script:Mutex = New-Object System.Threading.Mutex($false, $MUTEX_NAME)
+        try { $script:MutexOwned = $script:Mutex.WaitOne(0) }
+        catch [System.Threading.AbandonedMutexException] { $script:MutexOwned = $true }
+
+        if (-not $script:MutexOwned) {
+            Write-Log "Another updater instance is already running - exiting."
+            exit 0
+        }
+    }
+    catch {
+        Write-Log "Could not acquire single-instance lock: $($_.Exception.Message)" "WARN"
     }
 
     if ($Force) {
@@ -785,4 +947,12 @@ try {
 }
 catch {
     Write-Log "Critical error: $($_.Exception.Message)" "ERROR"
+}
+finally {
+    if ($script:MutexOwned) {
+        try { $script:Mutex.ReleaseMutex() } catch {}
+    }
+    if ($script:Mutex) {
+        try { $script:Mutex.Dispose() } catch {}
+    }
 }
